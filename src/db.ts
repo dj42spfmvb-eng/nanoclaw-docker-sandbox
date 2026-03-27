@@ -6,6 +6,7 @@ import { ASSISTANT_NAME, DATA_DIR, STORE_DIR } from './config.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
 import {
+  AgentRun,
   NewMessage,
   RegisteredGroup,
   ScheduledTask,
@@ -82,6 +83,31 @@ function createSchema(database: Database.Database): void {
       container_config TEXT,
       requires_trigger INTEGER DEFAULT 1
     );
+
+    CREATE TABLE IF NOT EXISTS agent_runs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      group_folder TEXT NOT NULL,
+      chat_jid TEXT NOT NULL,
+      sender TEXT,
+      sender_name TEXT,
+      request_summary TEXT,
+      started_at TEXT NOT NULL,
+      duration_ms INTEGER,
+      input_tokens INTEGER,
+      output_tokens INTEGER,
+      cache_read_tokens INTEGER,
+      cache_write_tokens INTEGER,
+      model TEXT,
+      provider TEXT DEFAULT 'anthropic',
+      tool_calls INTEGER,
+      status TEXT,
+      error TEXT,
+      container_name TEXT,
+      is_scheduled_task INTEGER DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_agent_runs_sender ON agent_runs(sender);
+    CREATE INDEX IF NOT EXISTS idx_agent_runs_started ON agent_runs(started_at);
+    CREATE INDEX IF NOT EXISTS idx_agent_runs_group ON agent_runs(group_folder);
   `);
 
   // Add context_mode column if it doesn't exist (migration for existing DBs)
@@ -598,6 +624,10 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
   );
 }
 
+export function deleteRegisteredGroup(jid: string): void {
+  db.prepare('DELETE FROM registered_groups WHERE jid = ?').run(jid);
+}
+
 export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
   const rows = db.prepare('SELECT * FROM registered_groups').all() as Array<{
     jid: string;
@@ -632,6 +662,79 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
     };
   }
   return result;
+}
+
+// --- Agent run tracking ---
+
+export function insertAgentRun(run: AgentRun): number {
+  const result = db
+    .prepare(
+      `
+    INSERT INTO agent_runs (
+      group_folder, chat_jid, sender, sender_name, request_summary,
+      started_at, duration_ms, input_tokens, output_tokens,
+      cache_read_tokens, cache_write_tokens, model, provider,
+      tool_calls, status, error, container_name, is_scheduled_task
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `,
+    )
+    .run(
+      run.group_folder,
+      run.chat_jid,
+      run.sender,
+      run.sender_name,
+      run.request_summary,
+      run.started_at,
+      run.duration_ms,
+      run.input_tokens,
+      run.output_tokens,
+      run.cache_read_tokens,
+      run.cache_write_tokens,
+      run.model,
+      run.provider,
+      run.tool_calls,
+      run.status,
+      run.error,
+      run.container_name,
+      run.is_scheduled_task,
+    );
+  return Number(result.lastInsertRowid);
+}
+
+export function updateAgentRun(
+  id: number,
+  updates: {
+    duration_ms: number;
+    input_tokens: number | null;
+    output_tokens: number | null;
+    cache_read_tokens: number | null;
+    cache_write_tokens: number | null;
+    model: string | null;
+    tool_calls: number | null;
+    status: string;
+    error: string | null;
+  },
+): void {
+  db.prepare(
+    `
+    UPDATE agent_runs SET
+      duration_ms = ?, input_tokens = ?, output_tokens = ?,
+      cache_read_tokens = ?, cache_write_tokens = ?, model = ?,
+      tool_calls = ?, status = ?, error = ?
+    WHERE id = ?
+  `,
+  ).run(
+    updates.duration_ms,
+    updates.input_tokens,
+    updates.output_tokens,
+    updates.cache_read_tokens,
+    updates.cache_write_tokens,
+    updates.model,
+    updates.tool_calls,
+    updates.status,
+    updates.error,
+    id,
+  );
 }
 
 // --- JSON migration ---

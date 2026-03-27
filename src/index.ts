@@ -1,10 +1,14 @@
 import fs from 'fs';
 import path from 'path';
 
+import { execFile } from 'child_process';
+
 import {
   ASSISTANT_NAME,
+  BACKUP_INTERVAL_MS,
   CREDENTIAL_PROXY_PORT,
   IDLE_TIMEOUT,
+  MODEL_ALIASES,
   POLL_INTERVAL,
   TIMEZONE,
   TRIGGER_PATTERN,
@@ -19,6 +23,7 @@ import {
   ContainerOutput,
   runContainerAgent,
   writeGroupsSnapshot,
+  writePermissionsSnapshot,
   writeTasksSnapshot,
 } from './container-runner.js';
 import {
@@ -30,6 +35,7 @@ import {
   getAllChats,
   getAllRegisteredGroups,
   getAllSessions,
+  deleteRegisteredGroup,
   getAllTasks,
   getMessagesSince,
   getNewMessages,
@@ -114,6 +120,48 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
   );
 }
 
+function updateGroupConfig(
+  jid: string,
+  updates: { containerConfig?: import('./types.js').ContainerConfig },
+): void {
+  const group = registeredGroups[jid];
+  if (!group) {
+    logger.warn({ jid }, 'Cannot update config: group not registered');
+    return;
+  }
+
+  if (updates.containerConfig) {
+    const existingMounts = group.containerConfig?.additionalMounts || [];
+    const newMounts = updates.containerConfig.additionalMounts || [];
+
+    group.containerConfig = {
+      ...group.containerConfig,
+      ...updates.containerConfig,
+      additionalMounts: [...existingMounts, ...newMounts],
+    };
+  }
+
+  registeredGroups[jid] = group;
+  setRegisteredGroup(jid, group);
+  logger.info({ jid, name: group.name }, 'Group config updated');
+}
+
+function unregisterGroup(jid: string): void {
+  const group = registeredGroups[jid];
+  if (!group) {
+    logger.warn({ jid }, 'Cannot unregister: group not found');
+    return;
+  }
+  if (group.isMain) {
+    logger.warn({ jid, name: group.name }, 'Cannot unregister the main group');
+    return;
+  }
+
+  delete registeredGroups[jid];
+  deleteRegisteredGroup(jid);
+  logger.info({ jid, name: group.name }, 'Group unregistered (data preserved)');
+}
+
 /**
  * Get available groups list for the agent.
  * Returns groups ordered by most recent activity.
@@ -137,6 +185,109 @@ export function _setRegisteredGroups(
   groups: Record<string, RegisteredGroup>,
 ): void {
   registeredGroups = groups;
+}
+
+// Pattern to detect @opus, @sonnet, @haiku override in message content
+const MODEL_OVERRIDE_PATTERN = /@(opus|sonnet|haiku)\b\s*/i;
+
+/**
+ * Resolve which model to use for this invocation.
+ * Priority: user override keyword in any message (last match wins) → group config → undefined (SDK default).
+ * If a keyword override is found, it is stripped from the message content.
+ *
+ * Security: model overrides are only allowed from the main group or from
+ * is_from_me messages. Other senders in non-main groups cannot escalate to
+ * expensive models.
+ */
+/** @internal — exported for testing */
+export function resolveModel(
+  messages: NewMessage[],
+  group: RegisteredGroup,
+  opts?: { isScheduledTask?: boolean },
+): string | undefined {
+  if (messages.length === 0) return resolveGroupModel(group);
+
+  // Scheduled tasks use group default — don't parse overrides from task prompts
+  if (opts?.isScheduledTask) return resolveGroupModel(group);
+
+  const isMain = group.isMain === true;
+
+  // Scan all messages for override; last match wins
+  let resolvedModel: string | undefined;
+  for (const msg of messages) {
+    const match = msg.content.match(MODEL_OVERRIDE_PATTERN);
+    if (match) {
+      const alias = match[1].toLowerCase();
+      const model = MODEL_ALIASES[alias];
+      if (model) {
+        // Security: only allow overrides from main group or own messages
+        if (!isMain && !msg.is_from_me) {
+          logger.warn(
+            { alias, group: group.name, sender: msg.sender },
+            'Model override denied: only allowed from main group or own messages',
+          );
+          // Strip the keyword anyway so agent doesn't see it
+          msg.content = msg.content.replace(MODEL_OVERRIDE_PATTERN, '').trim();
+          continue;
+        }
+        msg.content = msg.content.replace(MODEL_OVERRIDE_PATTERN, '').trim();
+        resolvedModel = model;
+        logger.info(
+          { model, alias, group: group.name },
+          'Model override from message',
+        );
+      } else {
+        logger.warn(
+          { alias, group: group.name },
+          'Unknown model alias in override, ignoring',
+        );
+      }
+    }
+  }
+
+  return resolvedModel || resolveGroupModel(group);
+}
+
+function resolveGroupModel(group: RegisteredGroup): string | undefined {
+  const groupModel = group.containerConfig?.model;
+  if (!groupModel) return undefined;
+  return MODEL_ALIASES[groupModel.toLowerCase()] || groupModel;
+}
+
+/**
+ * Detect a model override in messages without modifying them.
+ * Used in the piping path to check if a model swap is needed.
+ * Returns the resolved model ID, or undefined if no override found.
+ * Respects the same security constraints as resolveModel.
+ */
+/** @internal — exported for testing */
+export function detectModelOverride(
+  messages: NewMessage[],
+  group: RegisteredGroup,
+): string | undefined {
+  const isMain = group.isMain === true;
+
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    const match = msg.content.match(MODEL_OVERRIDE_PATTERN);
+    if (match) {
+      const alias = match[1].toLowerCase();
+      const model = MODEL_ALIASES[alias];
+      if (model && (isMain || msg.is_from_me)) {
+        return model;
+      }
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Strip model override keywords from message text.
+ * Returns the stripped text.
+ */
+/** @internal — exported for testing */
+export function stripModelOverride(text: string): string {
+  return text.replace(MODEL_OVERRIDE_PATTERN, '').trim();
 }
 
 /**
@@ -175,7 +326,18 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     if (!hasTrigger) return true;
   }
 
+  // Resolve model before formatting (may strip @model keyword from last message)
+  const model = resolveModel(missedMessages, group);
+
+  // Track model in queue so piping path can detect model swap requests
+  queue.setModel(chatJid, model);
+
   const prompt = formatMessages(missedMessages, TIMEZONE);
+
+  // Extract sender from the last message (the one that triggered the agent)
+  const lastMessage = missedMessages[missedMessages.length - 1];
+  const sender = lastMessage.sender;
+  const senderName = lastMessage.sender_name;
 
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
   // these messages. Save the old cursor so we can roll back on error.
@@ -185,7 +347,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   saveState();
 
   logger.info(
-    { group: group.name, messageCount: missedMessages.length },
+    {
+      group: group.name,
+      messageCount: missedMessages.length,
+      model: model || 'default',
+    },
     'Processing messages',
   );
 
@@ -207,32 +373,43 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let hadError = false;
   let outputSentToUser = false;
 
-  const output = await runAgent(group, prompt, chatJid, async (result) => {
-    // Streaming output callback — called for each agent result
-    if (result.result) {
-      const raw =
-        typeof result.result === 'string'
-          ? result.result
-          : JSON.stringify(result.result);
-      // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
-      const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
-      logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
-      if (text) {
-        await channel.sendMessage(chatJid, text);
-        outputSentToUser = true;
+  const output = await runAgent(
+    group,
+    prompt,
+    chatJid,
+    async (result) => {
+      // Streaming output callback — called for each agent result
+      if (result.result) {
+        const raw =
+          typeof result.result === 'string'
+            ? result.result
+            : JSON.stringify(result.result);
+        // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
+        const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
+        logger.info(
+          { group: group.name },
+          `Agent output: ${raw.slice(0, 200)}`,
+        );
+        if (text) {
+          await channel.sendMessage(chatJid, text);
+          outputSentToUser = true;
+        }
+        // Only reset idle timer on actual results, not session-update markers (result: null)
+        resetIdleTimer();
       }
-      // Only reset idle timer on actual results, not session-update markers (result: null)
-      resetIdleTimer();
-    }
 
-    if (result.status === 'success') {
-      queue.notifyIdle(chatJid);
-    }
+      if (result.status === 'success') {
+        queue.notifyIdle(chatJid);
+      }
 
-    if (result.status === 'error') {
-      hadError = true;
-    }
-  });
+      if (result.status === 'error') {
+        hadError = true;
+      }
+    },
+    sender,
+    senderName,
+    model,
+  );
 
   await channel.setTyping?.(chatJid, false);
   if (idleTimer) clearTimeout(idleTimer);
@@ -265,6 +442,9 @@ async function runAgent(
   prompt: string,
   chatJid: string,
   onOutput?: (output: ContainerOutput) => Promise<void>,
+  sender?: string,
+  senderName?: string,
+  model?: string,
 ): Promise<'success' | 'error'> {
   const isMain = group.isMain === true;
   const sessionId = sessions[group.folder];
@@ -294,6 +474,13 @@ async function runAgent(
     new Set(Object.keys(registeredGroups)),
   );
 
+  // Update permissions snapshot
+  writePermissionsSnapshot(
+    group.folder,
+    isMain,
+    Object.entries(registeredGroups).map(([jid, g]) => ({ jid, group: g })),
+  );
+
   // Wrap onOutput to track session ID from streamed results
   const wrappedOnOutput = onOutput
     ? async (output: ContainerOutput) => {
@@ -315,6 +502,9 @@ async function runAgent(
         chatJid,
         isMain,
         assistantName: ASSISTANT_NAME,
+        sender,
+        senderName,
+        model,
       },
       (proc, containerName) =>
         queue.registerProcess(chatJid, proc, containerName, group.folder),
@@ -413,6 +603,37 @@ async function startMessageLoop(): Promise<void> {
           );
           const messagesToSend =
             allPending.length > 0 ? allPending : groupMessages;
+
+          // Check for model override in the incoming messages
+          const requestedModel = detectModelOverride(messagesToSend, group);
+          const currentModel = queue.getModel(chatJid);
+
+          // If a different model is requested and container is idle, swap it
+          if (
+            requestedModel &&
+            requestedModel !== currentModel &&
+            queue.isIdle(chatJid)
+          ) {
+            logger.info(
+              {
+                chatJid,
+                currentModel: currentModel || 'default',
+                requestedModel,
+              },
+              'Model swap: stopping idle container for model change',
+            );
+            // Close the idle container — messages will be re-fetched from DB
+            // when the new container spawns via enqueueMessageCheck
+            queue.requestModelSwap(chatJid);
+            queue.enqueueMessageCheck(chatJid);
+            continue;
+          }
+
+          // Strip model override keywords before formatting
+          for (const msg of messagesToSend) {
+            msg.content = stripModelOverride(msg.content);
+          }
+
           const formatted = formatMessages(messagesToSend, TIMEZONE);
 
           if (queue.sendMessage(chatJid, formatted)) {
@@ -460,13 +681,29 @@ function recoverPendingMessages(): void {
   }
 }
 
-function ensureContainerSystemRunning(): void {
-  ensureContainerRuntimeRunning();
+async function ensureContainerSystemRunning(): Promise<void> {
+  await ensureContainerRuntimeRunning();
   cleanupOrphans();
 }
 
+function runBackup(): void {
+  const script = path.join(process.cwd(), 'scripts', 'backup.sh');
+  execFile('bash', [script], (err, stdout, stderr) => {
+    if (err) logger.error({ err, stderr }, 'Backup failed');
+    else logger.info('Scheduled backup completed');
+  });
+}
+
+function startBackupScheduler(): void {
+  const BACKUP_STARTUP_DELAY_MS = 5 * 60 * 1000;
+  setTimeout(() => {
+    runBackup();
+    setInterval(runBackup, BACKUP_INTERVAL_MS);
+  }, BACKUP_STARTUP_DELAY_MS);
+}
+
 async function main(): Promise<void> {
-  ensureContainerSystemRunning();
+  await ensureContainerSystemRunning();
   initDatabase();
   logger.info('Database initialized');
   loadState();
@@ -563,8 +800,26 @@ async function main(): Promise<void> {
       if (!channel) throw new Error(`No channel for JID: ${jid}`);
       return channel.sendMessage(jid, text);
     },
+    sendMedia: async (jid, hostPath, caption) => {
+      const channel = findChannel(channels, jid);
+      if (!channel || !channel.sendMedia) {
+        logger.warn({ jid }, 'Channel does not support sendMedia');
+        return;
+      }
+      await channel.sendMedia(jid, hostPath, caption);
+    },
+    sendVoice: async (jid, hostPath) => {
+      const channel = findChannel(channels, jid);
+      if (!channel || !channel.sendVoice) {
+        logger.warn({ jid }, 'Channel does not support sendVoice');
+        return;
+      }
+      await channel.sendVoice(jid, hostPath);
+    },
     registeredGroups: () => registeredGroups,
     registerGroup,
+    updateGroupConfig,
+    unregisterGroup,
     syncGroups: async (force: boolean) => {
       await Promise.all(
         channels
@@ -578,6 +833,7 @@ async function main(): Promise<void> {
   });
   queue.setProcessMessagesFn(processGroupMessages);
   recoverPendingMessages();
+  startBackupScheduler();
   startMessageLoop().catch((err) => {
     logger.fatal({ err }, 'Message loop crashed unexpectedly');
     process.exit(1);

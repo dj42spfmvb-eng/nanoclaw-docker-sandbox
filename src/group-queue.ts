@@ -25,6 +25,7 @@ interface GroupState {
   containerName: string | null;
   groupFolder: string | null;
   retryCount: number;
+  model: string | undefined; // Model the current container was started with
 }
 
 export class GroupQueue {
@@ -49,6 +50,7 @@ export class GroupQueue {
         containerName: null,
         groupFolder: null,
         retryCount: 0,
+        model: undefined,
       };
       this.groups.set(groupJid, state);
     }
@@ -142,6 +144,46 @@ export class GroupQueue {
   }
 
   /**
+   * Set the model for the current container (called when container is spawned).
+   */
+  setModel(groupJid: string, model: string | undefined): void {
+    const state = this.getGroup(groupJid);
+    state.model = model;
+  }
+
+  /**
+   * Get the model the current container is running with.
+   */
+  getModel(groupJid: string): string | undefined {
+    return this.getGroup(groupJid).model;
+  }
+
+  /**
+   * Check if the container is idle (finished work, waiting for IPC input).
+   */
+  isIdle(groupJid: string): boolean {
+    const state = this.getGroup(groupJid);
+    return state.active && state.idleWaiting;
+  }
+
+  /**
+   * Request a model swap: close the idle container so a new one can spawn.
+   * Returns true if the swap was initiated, false if the container is busy.
+   */
+  requestModelSwap(groupJid: string): boolean {
+    const state = this.getGroup(groupJid);
+    if (!state.active) return true; // No container running, swap is trivial
+    if (!state.idleWaiting) return false; // Container is busy, can't swap
+
+    logger.info(
+      { groupJid, containerName: state.containerName },
+      'Model swap: closing idle container',
+    );
+    this.closeStdin(groupJid);
+    return true;
+  }
+
+  /**
    * Mark the container as idle-waiting (finished work, waiting for IPC input).
    * If tasks are pending, preempt the idle container immediately.
    */
@@ -226,6 +268,7 @@ export class GroupQueue {
       state.process = null;
       state.containerName = null;
       state.groupFolder = null;
+      state.model = undefined;
       this.activeCount--;
       this.drainGroup(groupJid);
     }
@@ -255,6 +298,7 @@ export class GroupQueue {
       state.process = null;
       state.containerName = null;
       state.groupFolder = null;
+      state.model = undefined;
       this.activeCount--;
       this.drainGroup(groupJid);
     }

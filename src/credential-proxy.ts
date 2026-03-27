@@ -90,34 +90,75 @@ export function startCredentialProxy(
           }
         }
 
-        const upstream = makeRequest(
-          {
-            hostname: upstreamUrl.hostname,
-            port: upstreamUrl.port || (isHttps ? 443 : 80),
-            path: req.url,
-            method: req.method,
-            headers,
-            agent: isHttps ? upstreamProxyAgent : undefined,
-          } as RequestOptions,
-          (upRes) => {
-            res.writeHead(upRes.statusCode!, upRes.headers);
-            upRes.pipe(res);
-          },
-        );
+        // Connection-level errors that are safe to retry (transient network issues)
+        const RETRYABLE_CODES = new Set([
+          'ECONNRESET',
+          'ETIMEDOUT',
+          'ECONNREFUSED',
+          'ENOTFOUND',
+          'EPIPE',
+          'EAI_AGAIN',
+        ]);
+        const MAX_RETRIES = 2;
+        const BACKOFF_MS = [2000, 4000];
 
-        upstream.on('error', (err) => {
-          logger.error(
-            { err, url: req.url },
-            'Credential proxy upstream error',
+        const sendUpstream = (attempt: number) => {
+          const upstream = makeRequest(
+            {
+              hostname: upstreamUrl.hostname,
+              port: upstreamUrl.port || (isHttps ? 443 : 80),
+              path: req.url,
+              method: req.method,
+              headers,
+              agent: isHttps ? upstreamProxyAgent : undefined,
+            } as RequestOptions,
+            (upRes) => {
+              res.writeHead(upRes.statusCode!, upRes.headers);
+              upRes.pipe(res);
+            },
           );
-          if (!res.headersSent) {
-            res.writeHead(502);
-            res.end('Bad Gateway');
-          }
-        });
 
-        upstream.write(body);
-        upstream.end();
+          upstream.on('error', (err: NodeJS.ErrnoException) => {
+            const canRetry =
+              attempt < MAX_RETRIES &&
+              RETRYABLE_CODES.has(err.code || '') &&
+              !res.headersSent;
+
+            if (canRetry) {
+              const delay = BACKOFF_MS[attempt] || 4000;
+              logger.warn(
+                {
+                  err,
+                  url: req.url,
+                  attempt: attempt + 1,
+                  maxRetries: MAX_RETRIES,
+                  delayMs: delay,
+                },
+                'Credential proxy upstream error, retrying',
+              );
+              setTimeout(() => sendUpstream(attempt + 1), delay);
+            } else {
+              logger.error(
+                {
+                  err,
+                  url: req.url,
+                  attempt: attempt + 1,
+                  retriesExhausted: attempt >= MAX_RETRIES,
+                },
+                'Credential proxy upstream error',
+              );
+              if (!res.headersSent) {
+                res.writeHead(502);
+                res.end('Bad Gateway');
+              }
+            }
+          });
+
+          upstream.write(body);
+          upstream.end();
+        };
+
+        sendUpstream(0);
       });
     });
 

@@ -67,6 +67,18 @@ export const TRIGGER_PATTERN = new RegExp(
   'i',
 );
 
+// ── Backup ──────────────────────────────────────────────
+// How often to run automated backups (default: 24 hours).
+// Adjust this value to change backup frequency.
+export const BACKUP_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+// Model alias map for tiered routing
+export const MODEL_ALIASES: Record<string, string> = {
+  opus: 'claude-opus-4-6',
+  sonnet: 'claude-sonnet-4-6',
+  haiku: 'claude-haiku-4-5-20251001',
+};
+
 // Timezone for scheduled tasks (cron expressions, etc.)
 // Uses system timezone by default
 export const TIMEZONE =
