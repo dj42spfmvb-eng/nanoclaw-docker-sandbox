@@ -7,6 +7,7 @@ import { HttpsProxyAgent } from 'https-proxy-agent';
 import makeWASocket, {
   Browsers,
   DisconnectReason,
+  downloadMediaMessage,
   WASocket,
   fetchLatestWaWebVersion,
   makeCacheableSignalKeyStore,
@@ -68,10 +69,13 @@ async function fetchWaVersion(): Promise<[number, number, number] | undefined> {
 import {
   ASSISTANT_HAS_OWN_NUMBER,
   ASSISTANT_NAME,
+  GROUPS_DIR,
   STORE_DIR,
 } from '../config.js';
+
 import { getLastGroupSync, setLastGroupSync, updateChatName } from '../db.js';
 import { logger } from '../logger.js';
+import { isVoiceMessage, transcribeAudioMessage } from '../transcription.js';
 import {
   Channel,
   OnInboundMessage,
@@ -252,15 +256,70 @@ export class WhatsAppChannel implements Channel {
           // Only deliver full message for registered groups
           const groups = this.opts.registeredGroups();
           if (groups[chatJid]) {
-            const content =
+            let content =
               normalized.conversation ||
               normalized.extendedTextMessage?.text ||
               normalized.imageMessage?.caption ||
               normalized.videoMessage?.caption ||
               '';
 
+            // PDF attachment handling
+            if (normalized?.documentMessage?.mimetype === 'application/pdf') {
+              try {
+                // Helper: attempt download with reuploadRequest so Baileys can
+                // refresh expired CDN URLs (returns 404 if URL has expired).
+                const tryDownload = () =>
+                  downloadMediaMessage(
+                    msg,
+                    'buffer',
+                    {},
+                    { logger, reuploadRequest: this.sock.updateMediaMessage },
+                  );
+
+                let buffer: Buffer | null = null;
+                try {
+                  buffer = (await tryDownload()) as Buffer;
+                } catch (firstErr: any) {
+                  // One retry after a short delay in case of transient CDN issue
+                  logger.warn(
+                    { err: firstErr, jid: chatJid },
+                    'PDF download failed, retrying in 2s...',
+                  );
+                  await new Promise((r) => setTimeout(r, 2000));
+                  buffer = (await tryDownload()) as Buffer;
+                }
+
+                const groupDir = path.join(GROUPS_DIR, groups[chatJid].folder);
+                const attachDir = path.join(groupDir, 'attachments');
+                fs.mkdirSync(attachDir, { recursive: true });
+                const filename = path.basename(
+                  normalized.documentMessage.fileName ||
+                    `doc-${Date.now()}.pdf`,
+                );
+                const filePath = path.join(attachDir, filename);
+                fs.writeFileSync(filePath, buffer);
+                const sizeKB = Math.round(buffer.length / 1024);
+                const pdfRef = `[PDF: attachments/${filename} (${sizeKB}KB)]\nUse: pdf-reader extract attachments/${filename}`;
+                const caption = normalized.documentMessage.caption || '';
+                content = caption ? `${caption}\n\n${pdfRef}` : pdfRef;
+                logger.info(
+                  { jid: chatJid, filename },
+                  'Downloaded PDF attachment',
+                );
+              } catch (err) {
+                logger.warn(
+                  { err, jid: chatJid },
+                  'Failed to download PDF attachment after retry',
+                );
+                // Surface failure to agent so it can ask user to resend
+                content = '[PDF - download failed, please resend the file]';
+              }
+            }
+
             // Skip protocol messages with no text content (encryption keys, read receipts, etc.)
-            if (!content) continue;
+            // but allow voice messages through for transcription, and imageMessages for download
+            if (!content && !isVoiceMessage(msg) && !normalized.imageMessage)
+              continue;
 
             const sender = msg.key.participant || msg.key.remoteJid || '';
             const senderName = msg.pushName || sender.split('@')[0];
@@ -270,16 +329,84 @@ export class WhatsAppChannel implements Channel {
             // since only the bot sends from that number.
             // With shared number, bot messages carry the assistant name prefix
             // (even in DMs/self-chat) so we check for that.
+            // For media messages (voice, image, document) sent by the bot in shared
+            // number mode, there is no text prefix — use fromMe as the signal instead,
+            // since the bot is the only process sending outbound media on this session.
+            const isOutboundMedia =
+              fromMe &&
+              (isVoiceMessage(msg) ||
+                !!normalized.imageMessage ||
+                !!normalized.documentMessage);
             const isBotMessage = ASSISTANT_HAS_OWN_NUMBER
               ? fromMe
-              : content.startsWith(`${ASSISTANT_NAME}:`);
+              : content.startsWith(`${ASSISTANT_NAME}:`) || isOutboundMedia;
+
+            // Download and save incoming images
+            let finalContent = content;
+            if (normalized.imageMessage) {
+              try {
+                const group = groups[chatJid];
+                const incomingDir = path.join(
+                  GROUPS_DIR,
+                  group.folder,
+                  'incoming',
+                );
+                fs.mkdirSync(incomingDir, { recursive: true });
+                const ext = (normalized.imageMessage.mimetype || '').includes(
+                  'png',
+                )
+                  ? 'png'
+                  : 'jpg';
+                const safeId = (msg.key.id || 'img')
+                  .replace(/[^a-zA-Z0-9_-]/g, '')
+                  .slice(0, 12);
+                const filename = `${Date.now()}-${safeId}.${ext}`;
+                const filepath = path.join(incomingDir, filename);
+                const buffer = await downloadMediaMessage(
+                  msg,
+                  'buffer',
+                  {},
+                  { logger, reuploadRequest: this.sock.updateMediaMessage },
+                );
+                fs.writeFileSync(filepath, buffer as Buffer);
+                const containerPath = `/workspace/group/incoming/${filename}`;
+                finalContent = `[Image: ${containerPath}]${content ? '\n' + content : ''}`;
+                logger.info(
+                  { chatJid, filename, bytes: (buffer as Buffer).length },
+                  'Incoming image saved',
+                );
+              } catch (err) {
+                logger.warn(
+                  { err, chatJid },
+                  'Failed to download incoming image',
+                );
+                finalContent = finalContent || '[Image - download failed]';
+              }
+            }
+            if (isVoiceMessage(msg)) {
+              try {
+                const transcript = await transcribeAudioMessage(msg, this.sock);
+                if (transcript) {
+                  finalContent = `[Voice: ${transcript}]`;
+                  logger.info(
+                    { chatJid, length: transcript.length },
+                    'Transcribed voice message',
+                  );
+                } else {
+                  finalContent = '[Voice Message - transcription unavailable]';
+                }
+              } catch (err) {
+                logger.error({ err }, 'Voice transcription error');
+                finalContent = '[Voice Message - transcription failed]';
+              }
+            }
 
             this.opts.onMessage(chatJid, {
               id: msg.key.id || '',
               chat_jid: chatJid,
               sender,
               sender_name: senderName,
-              content,
+              content: finalContent,
               timestamp,
               is_from_me: fromMe,
               is_bot_message: isBotMessage,
@@ -322,6 +449,44 @@ export class WhatsAppChannel implements Channel {
         { jid, err, queueSize: this.outgoingQueue.length },
         'Failed to send, message queued',
       );
+    }
+  }
+
+  async sendVoice(jid: string, hostPath: string): Promise<void> {
+    if (!this.connected) {
+      logger.warn({ jid, hostPath }, 'WA disconnected, voice not queued');
+      return;
+    }
+    try {
+      const audio = await fs.promises.readFile(hostPath);
+      await this.sock.sendMessage(jid, {
+        audio,
+        ptt: true,
+        mimetype: 'audio/ogg; codecs=opus',
+      });
+      logger.info({ jid, bytes: audio.length }, 'Voice note sent');
+    } catch (err) {
+      logger.warn({ jid, hostPath, err }, 'Failed to send voice note');
+    }
+  }
+
+  async sendMedia(
+    jid: string,
+    hostPath: string,
+    caption?: string,
+  ): Promise<void> {
+    if (!this.connected) {
+      logger.warn({ jid, hostPath }, 'WA disconnected, media not queued');
+      return;
+    }
+    try {
+      const image = await fs.promises.readFile(hostPath);
+      const content: { image: Buffer; caption?: string } = { image };
+      if (caption) content.caption = caption;
+      await this.sock.sendMessage(jid, content);
+      logger.info({ jid, bytes: image.length }, 'Media sent');
+    } catch (err) {
+      logger.warn({ jid, hostPath, err }, 'Failed to send media');
     }
   }
 
@@ -444,4 +609,13 @@ export class WhatsAppChannel implements Channel {
   }
 }
 
-registerChannel('whatsapp', (opts: ChannelOpts) => new WhatsAppChannel(opts));
+registerChannel('whatsapp', (opts: ChannelOpts) => {
+  const authDir = path.join(STORE_DIR, 'auth');
+  if (!fs.existsSync(path.join(authDir, 'creds.json'))) {
+    logger.warn(
+      'WhatsApp: credentials not found. Run /add-whatsapp to authenticate.',
+    );
+    return null;
+  }
+  return new WhatsAppChannel(opts);
+});
