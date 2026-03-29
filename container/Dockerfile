@@ -1,9 +1,15 @@
 # NanoClaw Agent Container
 # Runs Claude Agent SDK in isolated Linux VM with browser automation
 
-FROM node:24-slim
+FROM node:22-slim
 
-# Install system dependencies for Chromium
+# Accept proxy build args and configure npm to work through MITM proxies
+ARG http_proxy
+ARG https_proxy
+ARG no_proxy
+ARG NODE_EXTRA_CA_CERTS
+
+# Install system dependencies for Chromium and PDF tools
 RUN apt-get update && apt-get install -y \
     chromium \
     fonts-liberation \
@@ -24,14 +30,19 @@ RUN apt-get update && apt-get install -y \
     libxshmfence1 \
     curl \
     git \
+    poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # Set Chromium path for agent-browser
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 
+# Disable strict SSL during build to handle MITM proxy certs
+ARG npm_config_strict_ssl=true
+RUN npm config set strict-ssl ${npm_config_strict_ssl}
+
 # Install agent-browser and claude-code globally
-RUN npm install -g agent-browser @anthropic-ai/claude-code
+RUN npm install -g agent-browser @anthropic-ai/claude-code drawio-mcp
 
 # Create app directory
 WORKDIR /app
@@ -42,11 +53,18 @@ COPY agent-runner/package*.json ./
 # Install dependencies
 RUN npm install
 
+# Re-enable strict SSL for runtime
+RUN npm config set strict-ssl true
+
 # Copy source code
 COPY agent-runner/ ./
 
 # Build TypeScript
 RUN npm run build
+
+# Install pdf-reader CLI
+COPY skills/pdf-reader/pdf-reader /usr/local/bin/pdf-reader
+RUN chmod +x /usr/local/bin/pdf-reader
 
 # Create workspace directories
 RUN mkdir -p /workspace/group /workspace/global /workspace/extra /workspace/ipc/messages /workspace/ipc/tasks /workspace/ipc/input
