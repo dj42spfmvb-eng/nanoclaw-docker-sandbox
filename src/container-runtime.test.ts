@@ -16,6 +16,11 @@ vi.mock('child_process', () => ({
   execSync: (...args: unknown[]) => mockExecSync(...args),
 }));
 
+// Mock timers/promises so tests don't actually wait
+vi.mock('timers/promises', () => ({
+  setTimeout: vi.fn().mockResolvedValue(undefined),
+}));
+
 import {
   CONTAINER_RUNTIME_BIN,
   readonlyMountArgs,
@@ -41,7 +46,7 @@ describe('readonlyMountArgs', () => {
 describe('stopContainer', () => {
   it('returns stop command using CONTAINER_RUNTIME_BIN', () => {
     expect(stopContainer('nanoclaw-test-123')).toBe(
-      `${CONTAINER_RUNTIME_BIN} stop -t 1 nanoclaw-test-123`,
+      `${CONTAINER_RUNTIME_BIN} stop nanoclaw-test-123`,
     );
   });
 });
@@ -49,10 +54,10 @@ describe('stopContainer', () => {
 // --- ensureContainerRuntimeRunning ---
 
 describe('ensureContainerRuntimeRunning', () => {
-  it('does nothing when runtime is already running', () => {
+  it('does nothing when runtime is already running', async () => {
     mockExecSync.mockReturnValueOnce('');
 
-    ensureContainerRuntimeRunning();
+    await ensureContainerRuntimeRunning();
 
     expect(mockExecSync).toHaveBeenCalledTimes(1);
     expect(mockExecSync).toHaveBeenCalledWith(`${CONTAINER_RUNTIME_BIN} info`, {
@@ -64,14 +69,36 @@ describe('ensureContainerRuntimeRunning', () => {
     );
   });
 
-  it('throws when docker info fails', () => {
-    mockExecSync.mockImplementationOnce(() => {
+  it('retries and succeeds when docker becomes ready', async () => {
+    mockExecSync
+      .mockImplementationOnce(() => {
+        throw new Error('not ready');
+      })
+      .mockImplementationOnce(() => {
+        throw new Error('not ready');
+      })
+      .mockReturnValueOnce(''); // succeeds on 3rd attempt
+
+    await ensureContainerRuntimeRunning();
+
+    expect(mockExecSync).toHaveBeenCalledTimes(3);
+    expect(logger.warn).toHaveBeenCalledTimes(2);
+    expect(logger.debug).toHaveBeenCalledWith(
+      'Container runtime already running',
+    );
+  });
+
+  it('throws after all retries are exhausted', async () => {
+    mockExecSync.mockImplementation(() => {
       throw new Error('Cannot connect to the Docker daemon');
     });
 
-    expect(() => ensureContainerRuntimeRunning()).toThrow(
+    await expect(ensureContainerRuntimeRunning()).rejects.toThrow(
       'Container runtime is required but failed to start',
     );
+    // 7 attempts total (1 initial + 6 retries)
+    expect(mockExecSync).toHaveBeenCalledTimes(7);
+    expect(logger.warn).toHaveBeenCalledTimes(6);
     expect(logger.error).toHaveBeenCalled();
   });
 });
@@ -93,12 +120,12 @@ describe('cleanupOrphans', () => {
     expect(mockExecSync).toHaveBeenCalledTimes(3);
     expect(mockExecSync).toHaveBeenNthCalledWith(
       2,
-      `${CONTAINER_RUNTIME_BIN} stop -t 1 nanoclaw-group1-111`,
+      `${CONTAINER_RUNTIME_BIN} stop nanoclaw-group1-111`,
       { stdio: 'pipe' },
     );
     expect(mockExecSync).toHaveBeenNthCalledWith(
       3,
-      `${CONTAINER_RUNTIME_BIN} stop -t 1 nanoclaw-group2-222`,
+      `${CONTAINER_RUNTIME_BIN} stop nanoclaw-group2-222`,
       { stdio: 'pipe' },
     );
     expect(logger.info).toHaveBeenCalledWith(

@@ -30,6 +30,7 @@ export interface AllowedRoot {
 export interface ContainerConfig {
   additionalMounts?: AdditionalMount[];
   timeout?: number; // Default: 300000 (5 minutes)
+  model?: string; // Claude model ID or alias (opus, sonnet, haiku)
 }
 
 export interface RegisteredGroup {
@@ -77,6 +78,27 @@ export interface TaskRunLog {
   error: string | null;
 }
 
+export interface AgentRun {
+  group_folder: string;
+  chat_jid: string;
+  sender: string | null;
+  sender_name: string | null;
+  request_summary: string | null;
+  started_at: string;
+  duration_ms: number;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  cache_read_tokens: number | null;
+  cache_write_tokens: number | null;
+  model: string | null;
+  provider: string;
+  tool_calls: number | null;
+  status: string;
+  error: string | null;
+  container_name: string | null;
+  is_scheduled_task: number;
+}
+
 // --- Channel abstraction ---
 
 export interface Channel {
@@ -88,6 +110,10 @@ export interface Channel {
   disconnect(): Promise<void>;
   // Optional: typing indicator. Channels that support it implement it.
   setTyping?(jid: string, isTyping: boolean): Promise<void>;
+  // Optional: send an image/media file to a chat.
+  sendMedia?(jid: string, hostPath: string, caption?: string): Promise<void>;
+  // Optional: send a voice note (PTT audio) to a chat.
+  sendVoice?(jid: string, hostPath: string): Promise<void>;
   // Optional: sync group/chat names from the platform.
   syncGroups?(force: boolean): Promise<void>;
 }

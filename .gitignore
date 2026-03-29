@@ -9,6 +9,11 @@ store/
 data/
 logs/
 
+# Stale artifacts from setup steps (real data is at top-level)
+container/store/
+container/groups/
+container/data/
+
 # Groups - only track base structure and specific CLAUDE.md files
 groups/*
 !groups/main/
@@ -21,6 +26,7 @@ groups/global/*
 # Secrets
 *.keys.json
 .env
+.claude/settings.local.json
 
 # Temp files
 .tmp-*
@@ -36,3 +42,9 @@ groups/global/*
 .nanoclaw/
 
 agents-sdk-docs
+nanoclaw.pid
+
+# User sync folders (host-specific, not portable)
+icloud-inbox
+icloud-outbox
+User_Library/

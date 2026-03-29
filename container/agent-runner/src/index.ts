@@ -27,6 +27,7 @@ interface ContainerInput {
   isMain: boolean;
   isScheduledTask?: boolean;
   assistantName?: string;
+  model?: string;
 }
 
 interface ContainerOutput {
@@ -336,7 +337,19 @@ async function runQuery(
   containerInput: ContainerInput,
   sdkEnv: Record<string, string | undefined>,
   resumeAt?: string,
-): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean }> {
+): Promise<{
+  newSessionId?: string;
+  lastAssistantUuid?: string;
+  closedDuringQuery: boolean;
+  usage: {
+    input_tokens: number;
+    output_tokens: number;
+    cache_read_tokens: number;
+    cache_write_tokens: number;
+    model?: string;
+    tool_calls: number;
+  };
+}> {
   const stream = new MessageStream();
   stream.push(prompt);
 
@@ -365,6 +378,12 @@ async function runQuery(
   let lastAssistantUuid: string | undefined;
   let messageCount = 0;
   let resultCount = 0;
+  let totalInputTokens = 0;
+  let totalOutputTokens = 0;
+  let totalCacheReadTokens = 0;
+  let totalCacheWriteTokens = 0;
+  let modelName: string | undefined;
+  let totalToolCalls = 0;
 
   // Load global CLAUDE.md as additional system context (shared across all groups)
   const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
@@ -392,6 +411,7 @@ async function runQuery(
   for await (const message of query({
     prompt: stream,
     options: {
+      model: containerInput.model,
       cwd: '/workspace/group',
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
       resume: sessionId,
@@ -407,7 +427,8 @@ async function runQuery(
         'TeamCreate', 'TeamDelete', 'SendMessage',
         'TodoWrite', 'ToolSearch', 'Skill',
         'NotebookEdit',
-        'mcp__nanoclaw__*'
+        'mcp__nanoclaw__*',
+        'mcp__drawio__*',
       ],
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
@@ -423,6 +444,10 @@ async function runQuery(
             NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
           },
         },
+        drawio: {
+          command: 'npx',
+          args: ['drawio-mcp'],
+        },
       },
       hooks: {
         PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName)] }],
@@ -435,6 +460,11 @@ async function runQuery(
 
     if (message.type === 'assistant' && 'uuid' in message) {
       lastAssistantUuid = (message as { uuid: string }).uuid;
+      // Count tool_use blocks for tool call tracking
+      const assistantMsg = message as { message?: { content?: Array<{ type: string }> } };
+      if (assistantMsg.message?.content) {
+        totalToolCalls += assistantMsg.message.content.filter(b => b.type === 'tool_use').length;
+      }
     }
 
     if (message.type === 'system' && message.subtype === 'init') {
@@ -450,7 +480,45 @@ async function runQuery(
     if (message.type === 'result') {
       resultCount++;
       const textResult = 'result' in message ? (message as { result?: string }).result : null;
-      log(`Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
+
+      // Extract cumulative usage and model info from result message
+      const resultMsg = message as {
+        usage?: {
+          input_tokens?: number;
+          output_tokens?: number;
+          cache_read_input_tokens?: number;
+          cache_creation_input_tokens?: number;
+        };
+        modelUsage?: Record<string, {
+          inputTokens?: number;
+          outputTokens?: number;
+          cacheReadInputTokens?: number;
+          cacheCreationInputTokens?: number;
+        }>;
+        total_cost_usd?: number;
+      };
+      // Prefer modelUsage (camelCase, cumulative per-model totals) over usage (may be partial)
+      if (resultMsg.modelUsage) {
+        const models = Object.keys(resultMsg.modelUsage);
+        if (models.length > 0) {
+          modelName = models[0];
+          // Sum across all models (usually just one)
+          for (const mu of Object.values(resultMsg.modelUsage)) {
+            totalInputTokens += mu.inputTokens || 0;
+            totalOutputTokens += mu.outputTokens || 0;
+            totalCacheReadTokens += mu.cacheReadInputTokens || 0;
+            totalCacheWriteTokens += mu.cacheCreationInputTokens || 0;
+          }
+        }
+      } else if (resultMsg.usage) {
+        // Fallback to usage (snake_case)
+        totalInputTokens += resultMsg.usage.input_tokens || 0;
+        totalOutputTokens += resultMsg.usage.output_tokens || 0;
+        totalCacheReadTokens += resultMsg.usage.cache_read_input_tokens || 0;
+        totalCacheWriteTokens += resultMsg.usage.cache_creation_input_tokens || 0;
+      }
+
+      log(`Result #${resultCount}: subtype=${message.subtype} tokens=in:${resultMsg.usage?.input_tokens || 0}/out:${resultMsg.usage?.output_tokens || 0} cost=$${resultMsg.total_cost_usd || 0}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
       writeOutput({
         status: 'success',
         result: textResult || null,
@@ -460,8 +528,20 @@ async function runQuery(
   }
 
   ipcPolling = false;
-  log(`Query done. Messages: ${messageCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}`);
-  return { newSessionId, lastAssistantUuid, closedDuringQuery };
+  log(`Query done. Messages: ${messageCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}, tokens: in=${totalInputTokens} out=${totalOutputTokens}`);
+  return {
+    newSessionId,
+    lastAssistantUuid,
+    closedDuringQuery,
+    usage: {
+      input_tokens: totalInputTokens,
+      output_tokens: totalOutputTokens,
+      cache_read_tokens: totalCacheReadTokens,
+      cache_write_tokens: totalCacheWriteTokens,
+      model: modelName,
+      tool_calls: totalToolCalls,
+    },
+  };
 }
 
 async function main(): Promise<void> {
@@ -471,7 +551,7 @@ async function main(): Promise<void> {
     const stdinData = await readStdin();
     containerInput = JSON.parse(stdinData);
     try { fs.unlinkSync('/tmp/input.json'); } catch { /* may not exist */ }
-    log(`Received input for group: ${containerInput.groupFolder}`);
+    log(`Received input for group: ${containerInput.groupFolder}, model: ${containerInput.model || 'default'}`);
   } catch (err) {
     writeOutput({
       status: 'error',
@@ -505,6 +585,25 @@ async function main(): Promise<void> {
     prompt += '\n' + pending.join('\n');
   }
 
+  // Cumulative usage tracking across all queries in this container session
+  const cumulativeUsage = {
+    input_tokens: 0,
+    output_tokens: 0,
+    cache_read_tokens: 0,
+    cache_write_tokens: 0,
+    model: undefined as string | undefined,
+    tool_calls: 0,
+  };
+
+  const writeUsageFile = () => {
+    try {
+      fs.writeFileSync('/workspace/ipc/agent_usage.json', JSON.stringify(cumulativeUsage));
+      log(`Wrote usage summary: in=${cumulativeUsage.input_tokens} out=${cumulativeUsage.output_tokens} tools=${cumulativeUsage.tool_calls}`);
+    } catch (err) {
+      log(`Failed to write usage file: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+
   // Query loop: run query → wait for IPC message → run new query → repeat
   let resumeAt: string | undefined;
   try {
@@ -512,6 +611,16 @@ async function main(): Promise<void> {
       log(`Starting query (session: ${sessionId || 'new'}, resumeAt: ${resumeAt || 'latest'})...`);
 
       const queryResult = await runQuery(prompt, sessionId, mcpServerPath, containerInput, sdkEnv, resumeAt);
+      cumulativeUsage.input_tokens += queryResult.usage.input_tokens;
+      cumulativeUsage.output_tokens += queryResult.usage.output_tokens;
+      cumulativeUsage.cache_read_tokens += queryResult.usage.cache_read_tokens;
+      cumulativeUsage.cache_write_tokens += queryResult.usage.cache_write_tokens;
+      cumulativeUsage.model = queryResult.usage.model || cumulativeUsage.model;
+      cumulativeUsage.tool_calls += queryResult.usage.tool_calls;
+
+      // Write usage after every query so the host has data even if container is killed
+      writeUsageFile();
+
       if (queryResult.newSessionId) {
         sessionId = queryResult.newSessionId;
       }
@@ -524,6 +633,7 @@ async function main(): Promise<void> {
       // idle timer and cause a 30-min delay before the next _close).
       if (queryResult.closedDuringQuery) {
         log('Close sentinel consumed during query, exiting');
+        writeUsageFile();
         break;
       }
 
@@ -536,6 +646,7 @@ async function main(): Promise<void> {
       const nextMessage = await waitForIpcMessage();
       if (nextMessage === null) {
         log('Close sentinel received, exiting');
+        writeUsageFile();
         break;
       }
 
@@ -545,6 +656,7 @@ async function main(): Promise<void> {
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
     log(`Agent error: ${errorMessage}`);
+    writeUsageFile();
     writeOutput({
       status: 'error',
       result: null,

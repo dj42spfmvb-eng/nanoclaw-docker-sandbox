@@ -53,16 +53,19 @@ beforeEach(() => {
 
   deps = {
     sendMessage: async () => {},
+    sendMedia: async () => {},
+    sendVoice: async () => {},
     registeredGroups: () => groups,
     registerGroup: (jid, group) => {
       groups[jid] = group;
       setRegisteredGroup(jid, group);
       // Mock the fs.mkdirSync that registerGroup does
     },
+    updateGroupConfig: () => {},
+    unregisterGroup: () => {},
     syncGroups: async () => {},
     getAvailableGroups: () => [],
     writeGroupsSnapshot: () => {},
-    onTasksChanged: () => {},
   };
 });
 
