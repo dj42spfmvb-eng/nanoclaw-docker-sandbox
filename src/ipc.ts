@@ -1453,11 +1453,11 @@ export async function processTaskIpc(
           const commitHash = execGit('git rev-parse --short HEAD');
           const diffStat = execGit('git diff --stat HEAD~1');
 
-          // Push
+          // Push (skip if no remote configured)
           let pushResult: string;
           try {
-            pushResult = execGit('git push backup main');
-            pushResult = 'Pushed to backup remote.';
+            pushResult = execGit('git push origin main');
+            pushResult = 'Pushed to origin remote.';
           } catch (pushErr) {
             pushResult = `Push failed: ${pushErr instanceof Error ? pushErr.message : String(pushErr)}`;
           }
