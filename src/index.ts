@@ -12,6 +12,7 @@ import {
   POLL_INTERVAL,
   TIMEZONE,
   TRIGGER_PATTERN,
+  escapeRegex,
 } from './config.js';
 import { startCredentialProxy } from './credential-proxy.js';
 import './channels/index.js';
@@ -291,6 +292,16 @@ export function stripModelOverride(text: string): string {
 }
 
 /**
+ * Build a trigger regex from a group's trigger string (e.g. "@hc" → /^@hc\b/i).
+ * Falls back to the global TRIGGER_PATTERN if the group has no custom trigger.
+ */
+function groupTriggerPattern(group: RegisteredGroup): RegExp {
+  if (!group.trigger) return TRIGGER_PATTERN;
+  const escaped = escapeRegex(group.trigger.replace(/^@/, ''));
+  return new RegExp(`^@${escaped}\\b`, 'i');
+}
+
+/**
  * Process all pending messages for a group.
  * Called by the GroupQueue when it's this group's turn.
  */
@@ -317,10 +328,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   // For non-main groups, check if trigger is required and present
   if (!isMainGroup && group.requiresTrigger !== false) {
+    const triggerRe = groupTriggerPattern(group);
     const allowlistCfg = loadSenderAllowlist();
     const hasTrigger = missedMessages.some(
       (m) =>
-        TRIGGER_PATTERN.test(m.content.trim()) &&
+        triggerRe.test(m.content.trim()) &&
         (m.is_from_me || isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
     );
     if (!hasTrigger) return true;
@@ -584,10 +596,11 @@ async function startMessageLoop(): Promise<void> {
           // Non-trigger messages accumulate in DB and get pulled as
           // context when a trigger eventually arrives.
           if (needsTrigger) {
+            const triggerRe = groupTriggerPattern(group);
             const allowlistCfg = loadSenderAllowlist();
             const hasTrigger = groupMessages.some(
               (m) =>
-                TRIGGER_PATTERN.test(m.content.trim()) &&
+                triggerRe.test(m.content.trim()) &&
                 (m.is_from_me ||
                   isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
             );
